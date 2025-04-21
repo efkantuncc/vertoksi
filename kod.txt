@@ -1,0 +1,998 @@
+import os
+import sys
+import json
+import requests
+import hashlib
+from datetime import datetime, timedelta
+from cryptography.fernet import Fernet
+from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, 
+                            QLabel, QLineEdit, QPushButton, QListWidget, QMessageBox, 
+                            QTabWidget, QProgressBar, QComboBox, QTextEdit, QFrame, 
+                            QListWidgetItem, QFileDialog, QCheckBox, QSlider, QColorDialog,
+                            QGroupBox, QScrollArea, QSizePolicy, QSplitter, QMenu)
+from PyQt5.QtCore import QThread, pyqtSignal, QTimer, Qt, QSize, QPoint, QSettings
+from PyQt5.QtGui import (QIcon, QFont, QColor, QPalette, QLinearGradient, QPainter, 
+                         QPen, QBrush, QPixmap, QCursor)
+
+# GitHub'dan VIP kodlarını çekmek için
+VIP_CODES_URL = "https://raw.githubusercontent.com/efkantuncc/vertoksi/refs/heads/main/veri.txt"
+
+class DownloadThread(QThread):
+    progress_updated = pyqtSignal(int, int, str)
+    download_completed = pyqtSignal(str)
+    speed_updated = pyqtSignal(float)
+    time_remaining = pyqtSignal(str)
+    paused = pyqtSignal()
+    resumed = pyqtSignal()
+
+    def __init__(self, url, save_path, download_speed):
+        super().__init__()
+        self.url = url
+        self.save_path = save_path
+        self.download_speed = download_speed
+        self._is_running = True
+        self._is_paused = False
+        self.start_time = datetime.now()
+        self.last_update_time = datetime.now()
+        self.last_bytes_received = 0
+        self.downloaded = 0
+        self.total_size = 0
+
+    def run(self):
+        try:
+            headers = {}
+            if os.path.exists(self.save_path):
+                self.downloaded = os.path.getsize(self.save_path)
+                headers = {'Range': f'bytes={self.downloaded}-'}
+            
+            response = requests.get(self.url, headers=headers, stream=True)
+            self.total_size = int(response.headers.get('content-length', 0)) + self.downloaded
+            
+            with open(self.save_path, 'ab') as f:
+                for data in response.iter_content(chunk_size=1024):
+                    while self._is_paused:
+                        QThread.msleep(100)
+                        if not self._is_running:
+                            return
+                    
+                    if not self._is_running:
+                        return
+                    
+                    f.write(data)
+                    self.downloaded += len(data)
+                    
+                    # Speed limiting for free users
+                    if self.download_speed != "full":
+                        elapsed = (datetime.now() - self.last_update_time).total_seconds()
+                        expected_time = 1024 / (self.download_speed * 1024)
+                        if elapsed < expected_time:
+                            QThread.msleep(int((expected_time - elapsed) * 1000))
+                    
+                    # Progress update
+                    progress = int((self.downloaded / self.total_size) * 100) if self.total_size > 0 else 0
+                    self.progress_updated.emit(progress, self.downloaded, self.format_size(self.total_size))
+                    
+                    # Speed calculation
+                    now = datetime.now()
+                    time_elapsed = (now - self.last_update_time).total_seconds()
+                    
+                    if time_elapsed >= 0.5:  # Update every 0.5 second for smoother display
+                        bytes_since_last = self.downloaded - self.last_bytes_received
+                        speed_kbps = (bytes_since_last / 1024) / time_elapsed
+                        self.speed_updated.emit(speed_kbps)
+                        
+                        # Time remaining calculation
+                        if speed_kbps > 0 and self.total_size > 0:
+                            remaining_bytes = self.total_size - self.downloaded
+                            remaining_seconds = remaining_bytes / (speed_kbps * 1024)
+                            self.time_remaining.emit(self.format_time(remaining_seconds))
+                        
+                        self.last_update_time = now
+                        self.last_bytes_received = self.downloaded
+
+            if self._is_running:
+                self.download_completed.emit(self.save_path)
+        except Exception as e:
+            print(f"Download error: {e}")
+
+    def pause(self):
+        self._is_paused = True
+        self.paused.emit()
+
+    def resume(self):
+        self._is_paused = False
+        self.resumed.emit()
+
+    def stop(self):
+        self._is_running = False
+        self._is_paused = False
+
+    def format_size(self, bytes):
+        for unit in ['B', 'KB', 'MB', 'GB']:
+            if bytes < 1024.0:
+                return f"{bytes:.2f} {unit}"
+            bytes /= 1024.0
+        return f"{bytes:.2f} TB"
+
+    def format_time(self, seconds):
+        if seconds < 60:
+            return f"{int(seconds)} sec"
+        elif seconds < 3600:
+            return f"{int(seconds // 60)} min {int(seconds % 60)} sec"
+        else:
+            return f"{int(seconds // 3600)} hour {int((seconds % 3600) // 60)} min"
+
+class DownloadItemWidget(QWidget):
+    def __init__(self, filename, item_id, parent=None):
+        super().__init__(parent)
+        self.item_id = item_id
+        self.parent = parent
+        self.is_paused = False
+        
+        self.setStyleSheet("background: transparent;")
+        self.layout = QVBoxLayout()
+        self.layout.setContentsMargins(5, 5, 5, 5)
+        self.layout.setSpacing(5)
+        self.setLayout(self.layout)
+        
+        # Main container
+        self.container = QWidget()
+        self.container.setStyleSheet("""
+            background: #252535;
+            border-radius: 6px;
+            border: 1px solid #3a3a4a;
+        """)
+        
+        container_layout = QVBoxLayout(self.container)
+        container_layout.setContentsMargins(10, 10, 10, 10)
+        container_layout.setSpacing(8)
+        
+        # Top row with filename and controls
+        top_row = QHBoxLayout()
+        top_row.setContentsMargins(0, 0, 0, 0)
+        
+        self.filename_label = QLabel(filename)
+        self.filename_label.setStyleSheet("""
+            font-weight: bold;
+            font-size: 12px;
+            color: #e0e0e0;
+        """)
+        self.filename_label.setWordWrap(True)
+        top_row.addWidget(self.filename_label, 1)
+        
+        # Control buttons
+        btn_layout = QHBoxLayout()
+        btn_layout.setSpacing(3)
+        
+        self.pause_btn = QPushButton("⏸")
+        self.pause_btn.setFixedSize(22, 22)
+        self.pause_btn.setStyleSheet("""
+            QPushButton {
+                background: #FF9800;
+                color: white;
+                border-radius: 3px;
+                font-weight: bold;
+                font-size: 10px;
+            }
+            QPushButton:hover {
+                background: #FFA726;
+            }
+        """)
+        self.pause_btn.clicked.connect(self.toggle_pause)
+        btn_layout.addWidget(self.pause_btn)
+        
+        self.cancel_btn = QPushButton("✕")
+        self.cancel_btn.setFixedSize(22, 22)
+        self.cancel_btn.setStyleSheet("""
+            QPushButton {
+                background: #ff4444;
+                color: white;
+                border-radius: 3px;
+                font-weight: bold;
+                font-size: 10px;
+            }
+            QPushButton:hover {
+                background: #ff5555;
+            }
+        """)
+        self.cancel_btn.clicked.connect(self.cancel_download)
+        btn_layout.addWidget(self.cancel_btn)
+        
+        top_row.addLayout(btn_layout)
+        container_layout.addLayout(top_row)
+        
+        # Progress bar
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setRange(0, 100)
+        self.progress_bar.setTextVisible(False)
+        self.progress_bar.setFixedHeight(4)
+        self.progress_bar.setStyleSheet("""
+            QProgressBar {
+                border: none;
+                border-radius: 2px;
+                background-color: #1e1e2e;
+            }
+            QProgressBar::chunk {
+                background-color: #4CAF50;
+                border-radius: 2px;
+            }
+        """)
+        container_layout.addWidget(self.progress_bar)
+        
+        # Stats row
+        stats_row = QHBoxLayout()
+        stats_row.setContentsMargins(0, 0, 0, 0)
+        stats_row.setSpacing(10)
+        
+        self.status_label = QLabel("Starting...")
+        self.status_label.setStyleSheet("color: #aaa; font-size: 10px;")
+        stats_row.addWidget(self.status_label)
+        
+        self.speed_label = QLabel("0 KB/s")
+        self.speed_label.setStyleSheet("color: #4CAF50; font-size: 10px;")
+        stats_row.addWidget(self.speed_label)
+        
+        self.time_label = QLabel("Calculating...")
+        self.time_label.setStyleSheet("color: #FF9800; font-size: 10px;")
+        stats_row.addWidget(self.time_label)
+        
+        self.size_label = QLabel("")
+        self.size_label.setStyleSheet("color: #aaa; font-size: 10px;")
+        stats_row.addWidget(self.size_label)
+        
+        container_layout.addLayout(stats_row)
+        
+        self.layout.addWidget(self.container)
+    
+    def toggle_pause(self):
+        if self.is_paused:
+            self.parent.resume_download(self.item_id)
+            self.pause_btn.setText("⏸")
+            self.status_label.setText("Resuming...")
+        else:
+            self.parent.pause_download(self.item_id)
+            self.pause_btn.setText("▶")
+            self.status_label.setText("Paused")
+        self.is_paused = not self.is_paused
+    
+    def cancel_download(self):
+        self.parent.cancel_download(self.item_id)
+
+class IDMApp(QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.settings = QSettings("EkoP", "DownloadManager")
+        self.load_settings()
+        
+        self.setWindowTitle("EkoP Download Manager")
+        self.setWindowIcon(QIcon("icon.ico"))
+        self.resize(self.window_size)
+        if self.window_position:
+            self.move(self.window_position)
+        
+        # Initialize user data
+        self.load_user_data()
+        
+        # Setup UI
+        self.init_ui()
+        
+        # Active downloads
+        self.active_downloads = {}
+        self.vip_codes = self.fetch_vip_codes()
+        
+        # Speed settings (KB/s)
+        self.speed_settings = {
+            "free": 100,  # Free users: 100 KB/s
+            "premium": 0  # Premium users: unlimited
+        }
+        
+        # Apply theme
+        self.apply_theme()
+
+    def load_settings(self):
+        self.window_size = self.settings.value("window_size", QSize(650, 500))
+        self.window_position = self.settings.value("window_position")
+        self.theme_color = QColor(self.settings.value("theme_color", "#4CAF50"))
+        self.dark_mode = self.settings.value("dark_mode", True, type=bool)
+        self.download_folder = self.settings.value("download_folder", os.path.expanduser("~/Downloads"))
+        self.max_parallel = self.settings.value("max_parallel", 3, type=int)
+        self.neon_effects = self.settings.value("neon_effects", True, type=bool)
+
+    def save_settings(self):
+        self.settings.setValue("window_size", self.size())
+        self.settings.setValue("window_position", self.pos())
+        self.settings.setValue("theme_color", self.theme_color.name())
+        self.settings.setValue("dark_mode", self.dark_mode)
+        self.settings.setValue("download_folder", self.download_folder)
+        self.settings.setValue("max_parallel", self.max_parallel)
+        self.settings.setValue("neon_effects", self.neon_effects)
+
+    def closeEvent(self, event):
+        self.save_settings()
+        super().closeEvent(event)
+
+    def apply_theme(self):
+        palette = QPalette()
+        
+        if self.dark_mode:
+            # Dark theme palette
+            palette.setColor(QPalette.Window, QColor(30, 30, 40))
+            palette.setColor(QPalette.WindowText, Qt.white)
+            palette.setColor(QPalette.Base, QColor(20, 20, 30))
+            palette.setColor(QPalette.AlternateBase, QColor(40, 40, 50))
+            palette.setColor(QPalette.ToolTipBase, Qt.white)
+            palette.setColor(QPalette.ToolTipText, Qt.white)
+            palette.setColor(QPalette.Text, Qt.white)
+            palette.setColor(QPalette.Button, QColor(50, 50, 60))
+            palette.setColor(QPalette.ButtonText, Qt.white)
+            palette.setColor(QPalette.BrightText, Qt.red)
+            palette.setColor(QPalette.Link, self.theme_color)
+            palette.setColor(QPalette.Highlight, self.theme_color)
+            palette.setColor(QPalette.HighlightedText, Qt.black)
+            
+            self.setStyleSheet(f"""
+                QMainWindow {{
+                    background-color: #1e1e2e;
+                }}
+                QLabel {{
+                    color: #e0e0e0;
+                }}
+                QLineEdit {{
+                    background: #252535;
+                    color: white;
+                    border: 1px solid #3a3a4a;
+                    padding: 6px;
+                    border-radius: 3px;
+                    selection-background-color: {self.theme_color.name()};
+                }}
+                QListWidget {{
+                    background: #252535;
+                    border: 1px solid #3a3a4a;
+                    border-radius: 5px;
+                }}
+                QTabWidget::pane {{
+                    border: none;
+                    background: #1e1e2e;
+                }}
+                QTabBar::tab {{
+                    background: #252535;
+                    color: #aaa;
+                    padding: 6px 12px;
+                    border: none;
+                    border-top-left-radius: 4px;
+                    border-top-right-radius: 4px;
+                    margin-right: 2px;
+                }}
+                QTabBar::tab:selected {{
+                    background: #2a2a3a;
+                    color: white;
+                    border-bottom: 2px solid {self.theme_color.name()};
+                }}
+                QTabBar::tab:hover {{
+                    background: #3a3a4a;
+                }}
+                QPushButton {{
+                    background: #3a3a4a;
+                    color: white;
+                    border: none;
+                    padding: 6px 12px;
+                    border-radius: 4px;
+                }}
+                QPushButton:hover {{
+                    background: #4a4a5a;
+                }}
+                QPushButton:pressed {{
+                    background: #2a2a3a;
+                }}
+                QStatusBar {{
+                    background: #252535;
+                    color: #aaa;
+                    border-top: 1px solid #3a3a4a;
+                }}
+                QGroupBox {{
+                    border: 1px solid #3a3a4a;
+                    border-radius: 5px;
+                    margin-top: 10px;
+                    padding-top: 15px;
+                }}
+                QGroupBox::title {{
+                    subcontrol-origin: margin;
+                    left: 10px;
+                    padding: 0 5px;
+                    color: {self.theme_color.name()};
+                }}
+                QScrollBar:vertical {{
+                    background: #252535;
+                    width: 10px;
+                    margin: 0px;
+                }}
+                QScrollBar::handle:vertical {{
+                    background: #3a3a4a;
+                    min-height: 20px;
+                    border-radius: 5px;
+                }}
+                QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {{
+                    height: 0px;
+                }}
+                QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical {{
+                    background: none;
+                }}
+            """)
+            
+            if self.neon_effects:
+                self.setStyleSheet(self.styleSheet() + f"""
+                    QPushButton {{
+                        border: 1px solid {self.theme_color.name()}55;
+                    }}
+                    QPushButton:hover {{
+                        border: 1px solid {self.theme_color.name()}aa;
+                    }}
+                    QPushButton:pressed {{
+                        border: 1px solid {self.theme_color.name()}55;
+                    }}
+                    QLineEdit:focus {{
+                        border: 1px solid {self.theme_color.name()}aa;
+                    }}
+                """)
+        else:
+            QApplication.setPalette(QApplication.style().standardPalette())
+            self.setStyleSheet(f"""
+                QTabBar::tab:selected {{
+                    border-bottom: 2px solid {self.theme_color.name()};
+                }}
+                QLineEdit {{
+                    selection-background-color: {self.theme_color.name()};
+                }}
+                QGroupBox::title {{
+                    color: {self.theme_color.name()};
+                }}
+            """)
+        
+        QApplication.setPalette(palette)
+
+    def fetch_vip_codes(self):
+        try:
+            response = requests.get(VIP_CODES_URL)
+            if response.status_code == 200:
+                return {
+                    code.strip(): int(days.strip())
+                    for line in response.text.split('\n')
+                    if '|' in line and (code, days := line.strip().split('|'))
+                }
+            return {}
+        except:
+            return {}
+
+    def load_user_data(self):
+        try:
+            if os.path.exists("user_data.json"):
+                with open("user_data.json", "r") as f:
+                    self.user_data = json.load(f)
+            else:
+                self.user_data = {
+                    "username": "guest",
+                    "membership": "free",
+                    "vip_expiry": None,
+                    "download_history": []
+                }
+        except:
+            self.user_data = {
+                "username": "guest",
+                "membership": "free",
+                "vip_expiry": None,
+                "download_history": []
+            }
+
+    def save_user_data(self):
+        with open("user_data.json", "w") as f:
+            json.dump(self.user_data, f)
+
+    def init_ui(self):
+        # Main widget and layout
+        main_widget = QWidget()
+        main_layout = QVBoxLayout()
+        main_layout.setContentsMargins(8, 8, 8, 8)
+        main_widget.setLayout(main_layout)
+        self.setCentralWidget(main_widget)
+        
+        # Create tabs
+        self.tabs = QTabWidget()
+        self.tabs.setDocumentMode(True)
+        
+        # Download tab
+        download_tab = QWidget()
+        download_layout = QVBoxLayout()
+        download_layout.setContentsMargins(0, 0, 0, 0)
+        download_tab.setLayout(download_layout)
+        
+        # URL input
+        url_group = QGroupBox("New Download")
+        url_layout = QVBoxLayout(url_group)
+        
+        url_row = QHBoxLayout()
+        url_row.addWidget(QLabel("URL:"))
+        self.url_input = QLineEdit()
+        self.url_input.setPlaceholderText("https://example.com/file.zip")
+        url_row.addWidget(self.url_input)
+        url_layout.addLayout(url_row)
+        
+        path_row = QHBoxLayout()
+        path_row.addWidget(QLabel("Save To:"))
+        self.save_input = QLineEdit()
+        self.save_input.setPlaceholderText(self.download_folder)
+        path_row.addWidget(self.save_input)
+        
+        self.browse_btn = QPushButton("...")
+        self.browse_btn.setFixedWidth(30)
+        self.browse_btn.clicked.connect(self.browse_save_path)
+        path_row.addWidget(self.browse_btn)
+        url_layout.addLayout(path_row)
+        
+        self.download_btn = QPushButton("Start Download")
+        self.download_btn.clicked.connect(self.start_download)
+        url_layout.addWidget(self.download_btn)
+        
+        download_layout.addWidget(url_group)
+        
+        # Download list
+        self.download_list = QListWidget()
+        self.download_list.setVerticalScrollMode(QListWidget.ScrollPerPixel)
+        self.download_list.setSpacing(5)
+        download_layout.addWidget(QLabel("Active Downloads:"))
+        download_layout.addWidget(self.download_list)
+        
+        self.tabs.addTab(download_tab, "Downloads")
+        
+        # Profile tab
+        profile_tab = QWidget()
+        profile_layout = QVBoxLayout()
+        profile_layout.setContentsMargins(10, 10, 10, 10)
+        profile_tab.setLayout(profile_layout)
+        
+        # Profile info
+        self.profile_info = QLabel()
+        self.profile_info.setWordWrap(True)
+        profile_layout.addWidget(self.profile_info)
+        
+        # VIP activation
+        vip_group = QGroupBox("VIP Activation")
+        vip_layout = QVBoxLayout(vip_group)
+        
+        code_layout = QHBoxLayout()
+        code_layout.addWidget(QLabel("Code:"))
+        self.vip_code_input = QLineEdit()
+        code_layout.addWidget(self.vip_code_input)
+        vip_layout.addLayout(code_layout)
+        
+        self.activate_btn = QPushButton("Activate VIP")
+        self.activate_btn.clicked.connect(self.activate_vip)
+        vip_layout.addWidget(self.activate_btn)
+        
+        profile_layout.addWidget(vip_group)
+        profile_layout.addStretch()
+        
+        self.tabs.addTab(profile_tab, "Profile")
+        
+        # History tab
+        history_tab = QWidget()
+        history_layout = QVBoxLayout()
+        history_layout.setContentsMargins(10, 10, 10, 10)
+        history_tab.setLayout(history_layout)
+        
+        self.history_list = QListWidget()
+        self.history_list.setVerticalScrollMode(QListWidget.ScrollPerPixel)
+        self.update_history_list()
+        history_layout.addWidget(QLabel("Download History:"))
+        history_layout.addWidget(self.history_list)
+        
+        self.tabs.addTab(history_tab, "History")
+        
+        # Settings tab
+        settings_tab = QWidget()
+        settings_layout = QVBoxLayout()
+        settings_layout.setContentsMargins(10, 10, 10, 10)
+        settings_tab.setLayout(settings_layout)
+        
+        # Appearance
+        appearance_group = QGroupBox("Appearance")
+        appearance_layout = QVBoxLayout(appearance_group)
+        
+        dark_mode_check = QCheckBox("Dark Mode")
+        dark_mode_check.setChecked(self.dark_mode)
+        dark_mode_check.stateChanged.connect(lambda: self.toggle_dark_mode(dark_mode_check.isChecked()))
+        appearance_layout.addWidget(dark_mode_check)
+        
+        neon_check = QCheckBox("Enable Neon Effects")
+        neon_check.setChecked(self.neon_effects)
+        neon_check.stateChanged.connect(lambda: self.toggle_neon_effects(neon_check.isChecked()))
+        appearance_layout.addWidget(neon_check)
+        
+        color_layout = QHBoxLayout()
+        color_layout.addWidget(QLabel("Theme Color:"))
+        
+        self.color_btn = QPushButton()
+        self.color_btn.setFixedSize(30, 30)
+        self.color_btn.setStyleSheet(f"background: {self.theme_color.name()}; border-radius: 15px;")
+        self.color_btn.clicked.connect(self.change_theme_color)
+        color_layout.addWidget(self.color_btn)
+        appearance_layout.addLayout(color_layout)
+        
+        settings_layout.addWidget(appearance_group)
+        
+        # Downloads
+        download_settings_group = QGroupBox("Download Settings")
+        download_settings_layout = QVBoxLayout(download_settings_group)
+        
+        folder_layout = QHBoxLayout()
+        folder_layout.addWidget(QLabel("Default Folder:"))
+        self.folder_display = QLineEdit(self.download_folder)
+        self.folder_display.setReadOnly(True)
+        folder_layout.addWidget(self.folder_display)
+        
+        folder_btn = QPushButton("...")
+        folder_btn.setFixedWidth(30)
+        folder_btn.clicked.connect(self.change_download_folder)
+        folder_layout.addWidget(folder_btn)
+        download_settings_layout.addLayout(folder_layout)
+        
+        parallel_layout = QHBoxLayout()
+        parallel_layout.addWidget(QLabel("Max Parallel Downloads:"))
+        
+        self.parallel_slider = QSlider(Qt.Horizontal)
+        self.parallel_slider.setRange(1, 10)
+        self.parallel_slider.setValue(self.max_parallel)
+        self.parallel_slider.valueChanged.connect(lambda: self.set_max_parallel(self.parallel_slider.value()))
+        parallel_layout.addWidget(self.parallel_slider)
+        
+        self.parallel_label = QLabel(str(self.max_parallel))
+        parallel_layout.addWidget(self.parallel_label)
+        download_settings_layout.addLayout(parallel_layout)
+        
+        settings_layout.addWidget(download_settings_group)
+        
+        # Premium features
+        premium_group = QGroupBox("Premium Features")
+        premium_layout = QVBoxLayout(premium_group)
+        
+        premium_layout.addWidget(QLabel("For premium users:"))
+        premium_layout.addWidget(QLabel("- Unlimited download speed"))
+        premium_layout.addWidget(QLabel("- Priority downloads"))
+        premium_layout.addWidget(QLabel("- No ads"))
+        
+        settings_layout.addWidget(premium_group)
+        settings_layout.addStretch()
+        
+        self.tabs.addTab(settings_tab, "Settings")
+        
+        # Changelog tab
+        changelog_tab = QWidget()
+        changelog_layout = QVBoxLayout()
+        changelog_layout.setContentsMargins(10, 10, 10, 10)
+        changelog_tab.setLayout(changelog_layout)
+        
+        changelog = QTextEdit()
+        changelog.setReadOnly(True)
+        changelog.setHtml("""
+            <h2>EkoP Download Manager v2.2</h2>
+            <h3>What's New:</h3>
+            <ul>
+                <li>New ultra-dark theme with neon effects</li>
+                <li>Improved download speed control</li>
+                <li>Pause/resume downloads</li>
+                <li>Download history tracking</li>
+                <li>More customization options</li>
+                <li>Better VIP integration</li>
+            </ul>
+            <h3>Future Updates:</h3>
+            <ul>
+                <li>Download scheduler</li>
+                <li>Batch downloads</li>
+                <li>Browser integration</li>
+            </ul>
+            <p>© 2023 EkoP Software - All Rights Reserved</p>
+        """)
+        changelog_layout.addWidget(changelog)
+        
+        self.tabs.addTab(changelog_tab, "Changelog")
+        
+        # Add tabs to main layout
+        main_layout.addWidget(self.tabs)
+        
+        # Status bar
+        self.status_bar = self.statusBar()
+        self.status_bar.showMessage("Ready")
+        
+        # Update profile info
+        self.update_profile_info()
+        
+        # Timer for download status
+        self.status_timer = QTimer()
+        self.status_timer.timeout.connect(self.check_download_status)
+        self.status_timer.start(1000)
+
+    def toggle_dark_mode(self, enabled):
+        self.dark_mode = enabled
+        self.apply_theme()
+        self.save_settings()
+
+    def toggle_neon_effects(self, enabled):
+        self.neon_effects = enabled
+        self.apply_theme()
+        self.save_settings()
+
+    def change_theme_color(self):
+        color = QColorDialog.getColor(self.theme_color, self, "Choose Theme Color")
+        if color.isValid():
+            self.theme_color = color
+            self.apply_theme()
+            self.save_settings()
+
+    def change_download_folder(self):
+        folder = QFileDialog.getExistingDirectory(self, "Select Download Folder", self.download_folder)
+        if folder:
+            self.download_folder = folder
+            self.folder_display.setText(folder)
+            self.save_settings()
+
+    def set_max_parallel(self, value):
+        self.max_parallel = value
+        self.parallel_label.setText(str(value))
+        self.save_settings()
+
+    def update_profile_info(self):
+        username = self.user_data["username"]
+        membership = self.user_data["membership"]
+        expiry = self.user_data["vip_expiry"]
+        
+        info_text = f"<b>Username:</b> {username}<br><br>"
+        info_text += f"<b>Membership:</b> {membership.upper()}<br><br>"
+        
+        if membership == "premium" and expiry:
+            expiry_date = datetime.strptime(expiry, "%Y-%m-%d")
+            remaining_days = (expiry_date - datetime.now()).days
+            info_text += f"<b>VIP Expiry:</b> {expiry} ({remaining_days} days remaining)<br><br>"
+        
+        info_text += f"<b>Download Speed:</b> {'Unlimited' if membership == 'premium' else '100 KB/s'}<br><br>"
+        info_text += f"<b>Total Downloads:</b> {len(self.user_data['download_history'])}"
+        
+        self.profile_info.setText(info_text)
+
+    def update_history_list(self):
+        self.history_list.clear()
+        for item in reversed(self.user_data["download_history"]):
+            list_item = QListWidgetItem()
+            list_item.setSizeHint(QSize(0, 60))
+            
+            widget = QWidget()
+            layout = QVBoxLayout()
+            layout.setContentsMargins(5, 5, 5, 5)
+            
+            filename = os.path.basename(item["path"])
+            status = item["status"].capitalize()
+            date = item["date"]
+            size = item.get("size", "?")
+            
+            label = QLabel(f"<b>{filename}</b> - {status}<br>"
+                          f"<small>Date: {date} | Size: {size}</small>")
+            label.setStyleSheet("color: #e0e0e0;" if self.dark_mode else "color: #333;")
+            label.setWordWrap(True)
+            
+            layout.addWidget(label)
+            widget.setLayout(layout)
+            
+            self.history_list.addItem(list_item)
+            self.history_list.setItemWidget(list_item, widget)
+
+    def browse_save_path(self):
+        default_path = os.path.join(self.download_folder, "file.zip")
+        file_path, _ = QFileDialog.getSaveFileName(self, "Save File", default_path, "All Files (*)")
+        if file_path:
+            self.save_input.setText(file_path)
+
+    def start_download(self):
+        url = self.url_input.text()
+        save_path = self.save_input.text() or os.path.join(self.download_folder, os.path.basename(url))
+        
+        if not url:
+            QMessageBox.warning(self, "Error", "Please enter a URL")
+            return
+        
+        # Set download speed
+        speed = "full" if self.user_data["membership"] == "premium" else self.speed_settings["free"]
+        
+        # Create download item
+        item_id = f"{url}_{datetime.now().timestamp()}"
+        filename = os.path.basename(save_path)
+        
+        # Create download thread
+        download_thread = DownloadThread(url, save_path, speed)
+        download_thread.progress_updated.connect(
+            lambda p, d, t: self.update_download_progress(item_id, p, d, t))
+        download_thread.speed_updated.connect(
+            lambda s: self.update_download_speed(item_id, s))
+        download_thread.time_remaining.connect(
+            lambda t: self.update_time_remaining(item_id, t))
+        download_thread.download_completed.connect(
+            lambda p: self.download_completed(item_id, p))
+        download_thread.paused.connect(
+            lambda: self.update_download_status(item_id, "Paused"))
+        download_thread.resumed.connect(
+            lambda: self.update_download_status(item_id, "Resuming..."))
+        
+        # Add to active downloads
+        self.active_downloads[item_id] = {
+            "thread": download_thread,
+            "url": url,
+            "save_path": save_path,
+            "progress": 0,
+            "speed": 0,
+            "time_remaining": "Calculating...",
+            "total_size": "0 B"
+        }
+        
+        # Create list item
+        list_item = QListWidgetItem()
+        list_item.setSizeHint(QSize(0, 80))
+        download_widget = DownloadItemWidget(filename, item_id, self)
+        
+        self.download_list.addItem(list_item)
+        self.download_list.setItemWidget(list_item, download_widget)
+        
+        self.active_downloads[item_id]["widget"] = download_widget
+        self.active_downloads[item_id]["list_item"] = list_item
+        
+        # Start download
+        download_thread.start()
+        
+        # Add to history
+        self.user_data["download_history"].append({
+            "url": url,
+            "path": save_path,
+            "date": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "status": "started",
+            "size": "0 B"
+        })
+        self.save_user_data()
+        
+        self.status_bar.showMessage(f"Starting download: {filename}")
+
+    def pause_download(self, item_id):
+        if item_id in self.active_downloads:
+            self.active_downloads[item_id]["thread"].pause()
+
+    def resume_download(self, item_id):
+        if item_id in self.active_downloads:
+            self.active_downloads[item_id]["thread"].resume()
+
+    def update_download_progress(self, item_id, progress, downloaded, total_size):
+        if item_id in self.active_downloads:
+            self.active_downloads[item_id]["progress"] = progress
+            self.active_downloads[item_id]["total_size"] = total_size
+            
+            widget = self.active_downloads[item_id]["widget"]
+            if widget:
+                widget.progress_bar.setValue(progress)
+                widget.size_label.setText(f"{downloaded / (1024 * 1024):.2f} MB / {total_size}")
+                widget.status_label.setText(f"Downloading ({progress}%)")
+
+    def update_download_speed(self, item_id, speed_kbps):
+        if item_id in self.active_downloads:
+            self.active_downloads[item_id]["speed"] = speed_kbps
+            
+            widget = self.active_downloads[item_id]["widget"]
+            if widget:
+                if speed_kbps < 1024:
+                    widget.speed_label.setText(f"{speed_kbps:.2f} KB/s")
+                else:
+                    widget.speed_label.setText(f"{speed_kbps / 1024:.2f} MB/s")
+
+    def update_download_status(self, item_id, status):
+        if item_id in self.active_downloads:
+            widget = self.active_downloads[item_id]["widget"]
+            if widget:
+                widget.status_label.setText(status)
+
+    def update_time_remaining(self, item_id, time):
+        if item_id in self.active_downloads:
+            self.active_downloads[item_id]["time_remaining"] = time
+            
+            widget = self.active_downloads[item_id]["widget"]
+            if widget:
+                widget.time_label.setText(time)
+
+    def download_completed(self, item_id, file_path):
+        if item_id in self.active_downloads:
+            widget = self.active_downloads[item_id]["widget"]
+            if widget:
+                widget.status_label.setText("Completed")
+                widget.speed_label.setText("")
+                widget.time_label.setText("")
+                widget.progress_bar.setValue(100)
+                widget.cancel_btn.setEnabled(False)
+                widget.pause_btn.setEnabled(False)
+            
+            # Update history
+            for item in self.user_data["download_history"]:
+                if item["path"] == file_path and item["status"] == "started":
+                    item["status"] = "completed"
+                    item["size"] = self.active_downloads[item_id]["total_size"]
+                    break
+            
+            self.save_user_data()
+            self.update_history_list()
+            
+            filename = os.path.basename(file_path)
+            self.status_bar.showMessage(f"Download completed: {filename}")
+            
+            # Remove after delay
+            QTimer.singleShot(3000, lambda: self.remove_completed_download(item_id))
+
+    def remove_completed_download(self, item_id):
+        if item_id in self.active_downloads:
+            row = self.download_list.row(self.active_downloads[item_id]["list_item"])
+            self.download_list.takeItem(row)
+            del self.active_downloads[item_id]
+
+    def cancel_download(self, item_id):
+        if item_id in self.active_downloads:
+            # Stop download
+            self.active_downloads[item_id]["thread"].stop()
+            
+            # Delete file
+            try:
+                if os.path.exists(self.active_downloads[item_id]["save_path"]):
+                    os.remove(self.active_downloads[item_id]["save_path"])
+            except:
+                pass
+            
+            # Update history
+            for item in self.user_data["download_history"]:
+                if item["path"] == self.active_downloads[item_id]["save_path"] and item["status"] == "started":
+                    item["status"] = "cancelled"
+                    break
+            
+            self.save_user_data()
+            self.update_history_list()
+            
+            filename = os.path.basename(self.active_downloads[item_id]["save_path"])
+            self.status_bar.showMessage(f"Download cancelled: {filename}")
+            
+            # Remove from list
+            row = self.download_list.row(self.active_downloads[item_id]["list_item"])
+            self.download_list.takeItem(row)
+            del self.active_downloads[item_id]
+
+    def check_download_status(self):
+        # Check for completed or failed downloads
+        pass
+
+    def activate_vip(self):
+        code = self.vip_code_input.text().strip()
+        
+        if not code:
+            QMessageBox.warning(self, "Error", "Please enter a VIP code")
+            return
+        
+        # Check VIP codes
+        if code in self.vip_codes:
+            days = self.vip_codes[code]
+            expiry_date = datetime.now() + timedelta(days=days)
+            
+            self.user_data["membership"] = "premium"
+            self.user_data["vip_expiry"] = expiry_date.strftime("%Y-%m-%d")
+            self.save_user_data()
+            self.update_profile_info()
+            
+            QMessageBox.information(self, "Success", 
+                                  f"VIP activated for {days} days!\nExpiry date: {expiry_date.strftime('%Y-%m-%d')}")
+            self.vip_code_input.clear()
+        else:
+            QMessageBox.warning(self, "Error", "Invalid VIP code")
+
+if __name__ == "__main__":
+    app = QApplication(sys.argv)
+    app.setStyle("Fusion")
+    
+    window = IDMApp()
+    window.show()
+    sys.exit(app.exec_())
