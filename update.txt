@@ -1,4 +1,4 @@
-update : false
+update : 2.3
 message : Yeni bir güncelleme mevcut güncellemeden kullanamazsınız !
 link : https://sanaozelll.rf.gd
 speed : 100
