@@ -1,0 +1,3 @@
+update : false
+message : Yeni bir güncelleme mevcut güncellemeden kullanamazsınız !
+link : https://sanaozelll.rf.gd
